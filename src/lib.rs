@@ -107,6 +107,7 @@ pub mod crc;
 pub mod demux;
 pub mod framing;
 pub mod mux;
+mod ogm;
 pub mod page;
 pub mod skeleton;
 pub mod theora;

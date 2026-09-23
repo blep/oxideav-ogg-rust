@@ -2467,6 +2467,17 @@ impl OggDemuxer {
         let mut params = guess_params(&codec_id, first)?;
         params.extradata = first.to_vec();
 
+        // Ogg Media (OGM) identification packets (`0x01 "video"` /
+        // `"audio"` / `"text"`) are not Xiph codec mappings, so
+        // `codec_id::detect` classified them as `unknown`. Parse the OGM
+        // header to classify the stream, name its codec, and recover the
+        // granule time base (without which an OGM video granule — a frame
+        // count — is mistaken for microseconds).
+        let ogm_header = crate::ogm::StreamHeader::parse(first);
+        if let Some(header) = &ogm_header {
+            header.apply(&mut params);
+        }
+
         // Opus carries its pre-skip in the OpusHead ID header (bytes 10..12,
         // LE u16, RFC 7845 §5.1 field 4). Record it per-serial so the
         // granule→time mapping can subtract it (RFC 7845 §4.3:
@@ -2492,35 +2503,38 @@ impl OggDemuxer {
             self.theora_granule.insert(bos_page.serial, id.granule());
         }
 
-        let time_base = match codec_id.as_str() {
-            // Vorbis / FLAC / Speex all carry a sample-count granule
-            // (Vorbis I §4.3; FLAC RFC 9639 §10.1 "the number of the last
-            // sample"; Speex manual §7.3 "the granulepos is the number of
-            // the last sample encoded in that packet"), so the native
-            // granule unit is `1/sample_rate` once the ID header reveals the
-            // rate. Without a rate we cannot translate the granule to a time
-            // and fall back to the 1 µs placeholder.
-            "vorbis" | "flac" | "speex" => {
-                if let Some(sr) = params.sample_rate {
-                    TimeBase::new(1, sr as i64)
-                } else {
-                    TimeBase::new(1, 1_000_000)
+        let time_base = ogm_header
+            .as_ref()
+            .and_then(crate::ogm::StreamHeader::time_base)
+            .unwrap_or_else(|| match codec_id.as_str() {
+                // Vorbis / FLAC / Speex all carry a sample-count granule
+                // (Vorbis I §4.3; FLAC RFC 9639 §10.1 "the number of the last
+                // sample"; Speex manual §7.3 "the granulepos is the number of
+                // the last sample encoded in that packet"), so the native
+                // granule unit is `1/sample_rate` once the ID header reveals the
+                // rate. Without a rate we cannot translate the granule to a time
+                // and fall back to the 1 µs placeholder.
+                "vorbis" | "flac" | "speex" => {
+                    if let Some(sr) = params.sample_rate {
+                        TimeBase::new(1, sr as i64)
+                    } else {
+                        TimeBase::new(1, 1_000_000)
+                    }
                 }
-            }
-            // Opus uses a 48 kHz timebase regardless of input sample rate.
-            "opus" => TimeBase::new(1, 48_000),
-            // Theora is fixed-frame-rate (spec §6.2 step 12: "Frames are
-            // sampled at the constant rate of FRN/FRD frames per second.
-            // The presentation time of the first frame is at zero
-            // seconds."), so one tick = one frame and per-packet pts are
-            // 0-based absolute frame indices. Falls back to the 1 µs
-            // placeholder when the ID header didn't parse.
-            "theora" => match theora_id.as_ref() {
-                Some(id) => TimeBase::new(id.frd as i64, id.frn as i64),
-                None => TimeBase::new(1, 1_000_000),
-            },
-            _ => TimeBase::new(1, 1_000_000),
-        };
+                // Opus uses a 48 kHz timebase regardless of input sample rate.
+                "opus" => TimeBase::new(1, 48_000),
+                // Theora is fixed-frame-rate (spec §6.2 step 12: "Frames are
+                // sampled at the constant rate of FRN/FRD frames per second.
+                // The presentation time of the first frame is at zero
+                // seconds."), so one tick = one frame and per-packet pts are
+                // 0-based absolute frame indices. Falls back to the 1 µs
+                // placeholder when the ID header didn't parse.
+                "theora" => match theora_id.as_ref() {
+                    Some(id) => TimeBase::new(id.frd as i64, id.frn as i64),
+                    None => TimeBase::new(1, 1_000_000),
+                },
+                _ => TimeBase::new(1, 1_000_000),
+            });
 
         self.streams.push(StreamInfo {
             index: public_index as u32,
@@ -2534,7 +2548,13 @@ impl OggDemuxer {
             LogicalStream {
                 public_index,
                 pending: Vec::new(),
-                headers_remaining: codec_id::header_packet_count_from_first(&codec_id, first),
+                headers_remaining: if ogm_header.is_some() {
+                    // OGM streams carry 2 header packets
+                    // (`ff_ogm_*_codec.nb_header` in ffmpeg's parser).
+                    2
+                } else {
+                    codec_id::header_packet_count_from_first(&codec_id, first)
+                },
                 header_packets: Vec::new(),
                 granule_seen: 0,
                 link_index: self.next_link_index,
